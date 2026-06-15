@@ -17,6 +17,7 @@
       <nav class="tabs">
         <button class="tab-btn active" data-tab="realtime">实时监控</button>
         <button class="tab-btn" data-tab="history">历史记录</button>
+        <button class="tab-btn" data-tab="anomaly">异常报告</button>
         <button class="tab-btn" data-tab="files">日志文件</button>
       </nav>
       <div class="top-actions">
@@ -177,6 +178,36 @@
         </div>
       </div>
 
+      <div class="tab-content" id="tab-anomaly">
+        <div class="anomaly-panel">
+          <div class="panel-header">
+            <h3>🚨 性能基线异常报告</h3>
+            <div class="anomaly-actions">
+              <button class="btn btn-outline btn-sm" id="btnRefreshReports">刷新</button>
+              <button class="btn btn-outline btn-sm" id="btnConfigureBaseline">基线配置</button>
+            </div>
+          </div>
+          <div class="anomaly-summary" id="anomalySummary"></div>
+          <div class="anomaly-table-container">
+            <table class="anomaly-table">
+              <thead>
+                <tr>
+                  <th>报告类型</th>
+                  <th>生成时间</th>
+                  <th>异常时段</th>
+                  <th>平均/最高/最低</th>
+                  <th>超幅</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="anomalyTableBody">
+                <tr><td colspan="6" class="empty-state">暂无异常报告，系统正在监测中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="tab-content" id="tab-files">
         <div class="files-panel">
           <div class="panel-header">
@@ -230,6 +261,68 @@
               <label>磁盘告警阈值 (%)</label>
               <input type="range" id="diskThreshold" min="10" max="100" value="90">
               <span class="threshold-value" id="diskThresholdValue">90%</span>
+            </div>
+          </div>
+          
+          <div class="settings-section">
+            <h3>性能基线配置</h3>
+            <p class="setting-description">设置正常运行的基线范围，连续5次超出范围将生成异常分析报告</p>
+            
+            <div class="baseline-config-item">
+              <div class="baseline-header">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="baselineCpuEnabled" checked>
+                  <span>CPU 基线监测</span>
+                </label>
+              </div>
+              <div class="baseline-range">
+                <div class="range-input">
+                  <label>最小值 (%)</label>
+                  <input type="number" id="baselineCpuMin" min="0" max="100" value="0">
+                </div>
+                <div class="range-input">
+                  <label>最大值 (%)</label>
+                  <input type="number" id="baselineCpuMax" min="0" max="100" value="70">
+                </div>
+              </div>
+            </div>
+            
+            <div class="baseline-config-item">
+              <div class="baseline-header">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="baselineMemoryEnabled" checked>
+                  <span>内存基线监测</span>
+                </label>
+              </div>
+              <div class="baseline-range">
+                <div class="range-input">
+                  <label>最小值 (%)</label>
+                  <input type="number" id="baselineMemoryMin" min="0" max="100" value="0">
+                </div>
+                <div class="range-input">
+                  <label>最大值 (%)</label>
+                  <input type="number" id="baselineMemoryMax" min="0" max="100" value="70">
+                </div>
+              </div>
+            </div>
+            
+            <div class="baseline-config-item">
+              <div class="baseline-header">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="baselineDiskEnabled" checked>
+                  <span>磁盘基线监测</span>
+                </label>
+              </div>
+              <div class="baseline-range">
+                <div class="range-input">
+                  <label>最小值 (%)</label>
+                  <input type="number" id="baselineDiskMin" min="0" max="100" value="0">
+                </div>
+                <div class="range-input">
+                  <label>最大值 (%)</label>
+                  <input type="number" id="baselineDiskMax" min="0" max="100" value="85">
+                </div>
+              </div>
             </div>
           </div>
           
@@ -328,6 +421,23 @@
         <div class="modal-footer">
           <button class="btn btn-secondary" id="btnCancelClean">取消</button>
           <button class="btn btn-danger" id="btnConfirmClean">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-overlay" id="reportDetailModal">
+      <div class="modal modal-xl">
+        <div class="modal-header">
+          <h2 id="reportDetailTitle">异常报告详情</h2>
+          <button class="btn-close" id="btnCloseReportDetail">×</button>
+        </div>
+        <div class="modal-body" id="reportDetailBody">
+          <div class="loading">加载中...</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnCloseReportDetail2">关闭</button>
+          <button class="btn btn-outline" id="btnDownloadReport">下载报告</button>
+          <button class="btn btn-danger" id="btnDeleteReport">删除报告</button>
         </div>
       </div>
     </div>

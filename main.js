@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const si = require('systeminformation');
 const path = require('path');
+const fs = require('fs');
 const LogManager = require('./log-manager');
 
 let mainWindow;
@@ -11,6 +12,21 @@ let alertThresholds = {
   disk: 90,
   network: 100
 };
+let baselineConfig = {
+  cpu: { min: 0, max: 70, enabled: true },
+  memory: { min: 0, max: 70, enabled: true },
+  disk: { min: 0, max: 85, enabled: true }
+};
+let recentSamples = {
+  cpu: [],
+  memory: [],
+  disk: []
+};
+const MAX_SAMPLES = 5;
+let anomalyReports = [];
+let reportsDir = '';
+let cooldownUntil = { cpu: 0, memory: 0, disk: 0 };
+const COOLDOWN_MS = 60000;
 let alertHistory = [];
 let maxHistoryPoints = 60;
 let logIntervalMs = 60000;
@@ -40,6 +56,8 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow();
+  initReportsDir();
+  loadAnomalyReports();
   startMonitoring();
 
   app.on('activate', () => {
@@ -48,6 +66,36 @@ app.whenReady().then(() => {
     }
   });
 });
+
+function initReportsDir() {
+  reportsDir = path.join(app.getPath('userData'), 'anomaly_reports');
+  if (!fs.existsSync(reportsDir)) {
+    fs.mkdirSync(reportsDir, { recursive: true });
+  }
+}
+
+function loadAnomalyReports() {
+  const indexPath = path.join(reportsDir, '.reports_index.json');
+  anomalyReports = [];
+  if (fs.existsSync(indexPath)) {
+    try {
+      const content = fs.readFileSync(indexPath, 'utf-8');
+      anomalyReports = JSON.parse(content);
+    } catch (err) {
+      console.error('加载异常报告索引失败:', err);
+      anomalyReports = [];
+    }
+  }
+}
+
+function saveReportsIndex() {
+  const indexPath = path.join(reportsDir, '.reports_index.json');
+  try {
+    fs.writeFileSync(indexPath, JSON.stringify(anomalyReports, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('保存异常报告索引失败:', err);
+  }
+}
 
 app.on('window-all-closed', async () => {
   stopMonitoring();
@@ -69,6 +117,7 @@ function startMonitoring() {
         mainWindow.webContents.send('system-data', data);
       }
       checkAlerts(data);
+      checkBaselineAnomalies(data);
       
       if (logManager && logManager.isLogging) {
         logManager.addRecord(data);
@@ -199,6 +248,145 @@ function checkAlerts(data) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('alerts', alerts);
     }
+  }
+}
+
+function isOutsideBaseline(type, value) {
+  const config = baselineConfig[type];
+  if (!config || !config.enabled) return false;
+  return value < config.min || value > config.max;
+}
+
+function checkBaselineAnomalies(data) {
+  const metrics = [
+    { type: 'cpu', value: data.cpu.usage },
+    { type: 'memory', value: data.memory.usage },
+    { type: 'disk', value: data.disk.usage }
+  ];
+
+  for (const metric of metrics) {
+    recentSamples[metric.type].push({
+      value: metric.value,
+      timestamp: data.timestamp,
+      processes: data.topProcesses
+    });
+
+    if (recentSamples[metric.type].length > MAX_SAMPLES) {
+      recentSamples[metric.type].shift();
+    }
+
+    if (recentSamples[metric.type].length === MAX_SAMPLES) {
+      const allOutside = recentSamples[metric.type].every(
+        s => isOutsideBaseline(metric.type, s.value)
+      );
+
+      const now = Date.now();
+      if (allOutside && now > cooldownUntil[metric.type]) {
+        generateAnomalyReport(metric.type, [...recentSamples[metric.type]]);
+        cooldownUntil[metric.type] = now + COOLDOWN_MS;
+        recentSamples[metric.type] = [];
+      }
+    }
+  }
+}
+
+function generateAnomalyReport(type, samples) {
+  const config = baselineConfig[type];
+  const values = samples.map(s => s.value);
+  const avg = values.reduce((a, b) => a + b, 0) / values.length;
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+
+  const exceedAmount = Math.max(0, max - config.max) + Math.max(0, config.min - min);
+  const baselineRange = config.max - config.min;
+  const exceedPercent = baselineRange > 0 ? parseFloat(((exceedAmount / baselineRange) * 100).toFixed(2)) : 0;
+
+  const allProcesses = samples.flatMap(s => s.processes || []);
+  const processMap = new Map();
+  for (const p of allProcesses) {
+    if (!processMap.has(p.pid)) {
+      processMap.set(p.pid, { ...p, count: 0, cpuSum: 0, memSum: 0 });
+    }
+    const existing = processMap.get(p.pid);
+    existing.count++;
+    existing.cpuSum += p.cpu;
+    existing.memSum += p.mem;
+  }
+
+  const topProcesses = Array.from(processMap.values())
+    .map(p => ({
+      pid: p.pid,
+      name: p.name,
+      avgCpu: parseFloat((p.cpuSum / p.count).toFixed(2)),
+      avgMem: parseFloat((p.memSum / p.count).toFixed(2)),
+      occurrenceCount: p.count
+    }))
+    .sort((a, b) => {
+      if (type === 'cpu') return b.avgCpu - a.avgCpu;
+      return b.avgMem - a.avgMem;
+    })
+    .slice(0, 3);
+
+  const reportId = `${type}_${Date.now()}`;
+  const now = new Date();
+  const fileName = `anomaly_${type}_${now.toISOString().slice(0, 10)}_${now.toISOString().slice(11, 19).replace(/:/g, '-')}.json`;
+  const filePath = path.join(reportsDir, fileName);
+
+  const report = {
+    id: reportId,
+    type,
+    typeName: { cpu: 'CPU', memory: '内存', disk: '磁盘' }[type],
+    generatedAt: now.toISOString(),
+    startTime: samples[0].timestamp,
+    endTime: samples[samples.length - 1].timestamp,
+    sampleCount: samples.length,
+    baseline: {
+      min: config.min,
+      max: config.max
+    },
+    statistics: {
+      average: parseFloat(avg.toFixed(2)),
+      maximum: parseFloat(max.toFixed(2)),
+      minimum: parseFloat(min.toFixed(2))
+    },
+    exceedPercent,
+    samples: samples.map(s => ({
+      timestamp: s.timestamp,
+      value: s.value
+    })),
+    topProcesses
+  };
+
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(report, null, 2), 'utf-8');
+
+    anomalyReports.unshift({
+      id: reportId,
+      type,
+      typeName: report.typeName,
+      generatedAt: report.generatedAt,
+      startTime: report.startTime,
+      endTime: report.endTime,
+      sampleCount: report.sampleCount,
+      statistics: report.statistics,
+      exceedPercent,
+      fileName,
+      filePath
+    });
+
+    if (anomalyReports.length > 500) {
+      anomalyReports = anomalyReports.slice(0, 500);
+    }
+
+    saveReportsIndex();
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('anomaly-report-generated', anomalyReports[0]);
+    }
+
+    console.log(`异常报告已生成: ${filePath}`);
+  } catch (err) {
+    console.error('生成异常报告失败:', err);
   }
 }
 
@@ -388,4 +576,86 @@ ipcMain.on('delete-old-logs', async (event, daysToKeep) => {
 
 ipcMain.on('get-history-data', (event) => {
   event.reply('history-data', []);
+});
+
+ipcMain.on('get-baseline-config', (event) => {
+  event.reply('baseline-config', JSON.parse(JSON.stringify(baselineConfig)));
+});
+
+ipcMain.on('update-baseline-config', (event, newConfig) => {
+  try {
+    baselineConfig = {
+      cpu: { ...baselineConfig.cpu, ...newConfig.cpu },
+      memory: { ...baselineConfig.memory, ...newConfig.memory },
+      disk: { ...baselineConfig.disk, ...newConfig.disk }
+    };
+    event.reply('baseline-config-updated', JSON.parse(JSON.stringify(baselineConfig)));
+  } catch (err) {
+    event.reply('baseline-config-error', { error: err.message });
+  }
+});
+
+ipcMain.on('get-anomaly-reports', (event) => {
+  event.reply('anomaly-reports', JSON.parse(JSON.stringify(anomalyReports)));
+});
+
+ipcMain.on('get-anomaly-report-detail', (event, reportId) => {
+  try {
+    const reportMeta = anomalyReports.find(r => r.id === reportId);
+    if (!reportMeta) {
+      event.reply('anomaly-report-detail', { error: '报告不存在' });
+      return;
+    }
+
+    const content = fs.readFileSync(reportMeta.filePath, 'utf-8');
+    const reportDetail = JSON.parse(content);
+    event.reply('anomaly-report-detail', reportDetail);
+  } catch (err) {
+    event.reply('anomaly-report-detail', { error: err.message });
+  }
+});
+
+ipcMain.on('download-anomaly-report', async (event, reportId) => {
+  try {
+    const reportMeta = anomalyReports.find(r => r.id === reportId);
+    if (!reportMeta) {
+      event.reply('download-report-error', { error: '报告不存在' });
+      return;
+    }
+
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: '保存异常报告',
+      defaultPath: reportMeta.fileName,
+      filters: [{ name: 'JSON 文件', extensions: ['json'] }]
+    });
+
+    if (result.canceled) return;
+
+    const content = fs.readFileSync(reportMeta.filePath, 'utf-8');
+    fs.writeFileSync(result.filePath, content, 'utf-8');
+    event.reply('download-report-success', { file: result.filePath });
+  } catch (err) {
+    event.reply('download-report-error', { error: err.message });
+  }
+});
+
+ipcMain.on('delete-anomaly-report', (event, reportId) => {
+  try {
+    const index = anomalyReports.findIndex(r => r.id === reportId);
+    if (index === -1) {
+      event.reply('delete-report-error', { error: '报告不存在' });
+      return;
+    }
+
+    const reportMeta = anomalyReports[index];
+    if (fs.existsSync(reportMeta.filePath)) {
+      fs.unlinkSync(reportMeta.filePath);
+    }
+
+    anomalyReports.splice(index, 1);
+    saveReportsIndex();
+    event.reply('delete-report-success', { id: reportId });
+  } catch (err) {
+    event.reply('delete-report-error', { error: err.message });
+  }
 });

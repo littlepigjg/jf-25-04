@@ -17,13 +17,18 @@ let historyOffset = 0;
 let historyHasMore = false;
 let historyTotal = 0;
 let currentFiles = [];
+let currentBaselineConfig = null;
+let anomalyReports = [];
+let currentViewingReportId = null;
 
 document.addEventListener('DOMContentLoaded', () => {
   initCharts();
   bindEvents();
   ipcRenderer.send('get-thresholds');
+  ipcRenderer.send('get-baseline-config');
   ipcRenderer.send('get-logging-status');
   ipcRenderer.send('get-alert-history');
+  ipcRenderer.send('get-anomaly-reports');
   setDefaultDates();
 });
 
@@ -285,6 +290,27 @@ function bindEvents() {
   document.getElementById('maxFileSize').addEventListener('input', (e) => {
     document.getElementById('maxFileSizeValue').textContent = e.target.value + ' MB';
   });
+
+  document.getElementById('btnRefreshReports').addEventListener('click', () => {
+    ipcRenderer.send('get-anomaly-reports');
+  });
+
+  document.getElementById('btnConfigureBaseline').addEventListener('click', () => {
+    openSettings();
+  });
+
+  document.getElementById('btnCloseReportDetail').addEventListener('click', closeReportDetailModal);
+  document.getElementById('btnCloseReportDetail2').addEventListener('click', closeReportDetailModal);
+  document.getElementById('btnDownloadReport').addEventListener('click', () => {
+    if (currentViewingReportId) {
+      ipcRenderer.send('download-anomaly-report', currentViewingReportId);
+    }
+  });
+  document.getElementById('btnDeleteReport').addEventListener('click', () => {
+    if (currentViewingReportId && confirm('确定要删除此报告吗？此操作不可撤销。')) {
+      ipcRenderer.send('delete-anomaly-report', currentViewingReportId);
+    }
+  });
 }
 
 function switchTab(tab) {
@@ -297,6 +323,9 @@ function switchTab(tab) {
 
   if (tab === 'files') {
     refreshFiles();
+  }
+  if (tab === 'anomaly') {
+    ipcRenderer.send('get-anomaly-reports');
   }
 }
 
@@ -374,6 +403,66 @@ ipcRenderer.on('thresholds-data', (event, thresholds) => {
 ipcRenderer.on('thresholds-updated', (event, thresholds) => {
   showToast('success', '设置已保存');
   closeSettings();
+});
+
+ipcRenderer.on('baseline-config', (event, config) => {
+  currentBaselineConfig = config;
+  document.getElementById('baselineCpuEnabled').checked = config.cpu.enabled;
+  document.getElementById('baselineCpuMin').value = config.cpu.min;
+  document.getElementById('baselineCpuMax').value = config.cpu.max;
+  document.getElementById('baselineMemoryEnabled').checked = config.memory.enabled;
+  document.getElementById('baselineMemoryMin').value = config.memory.min;
+  document.getElementById('baselineMemoryMax').value = config.memory.max;
+  document.getElementById('baselineDiskEnabled').checked = config.disk.enabled;
+  document.getElementById('baselineDiskMin').value = config.disk.min;
+  document.getElementById('baselineDiskMax').value = config.disk.max;
+});
+
+ipcRenderer.on('baseline-config-updated', (event, config) => {
+  currentBaselineConfig = config;
+  showToast('success', '基线配置已保存');
+});
+
+ipcRenderer.on('baseline-config-error', (event, data) => {
+  showToast('error', `基线配置保存失败: ${data.error}`);
+});
+
+ipcRenderer.on('anomaly-reports', (event, reports) => {
+  anomalyReports = reports;
+  renderAnomalyReports(reports);
+});
+
+ipcRenderer.on('anomaly-report-generated', (event, report) => {
+  anomalyReports.unshift(report);
+  renderAnomalyReports(anomalyReports);
+  showToast('warning', `检测到 ${report.typeName} 基线异常，已生成分析报告`);
+});
+
+ipcRenderer.on('anomaly-report-detail', (event, report) => {
+  if (report.error) {
+    showToast('error', `加载报告失败: ${report.error}`);
+    return;
+  }
+  renderReportDetail(report);
+});
+
+ipcRenderer.on('download-report-success', (event, data) => {
+  showToast('success', `报告已保存到: ${data.file}`);
+});
+
+ipcRenderer.on('download-report-error', (event, data) => {
+  showToast('error', `下载失败: ${data.error}`);
+});
+
+ipcRenderer.on('delete-report-success', (event, data) => {
+  anomalyReports = anomalyReports.filter(r => r.id !== data.id);
+  renderAnomalyReports(anomalyReports);
+  closeReportDetailModal();
+  showToast('success', '报告已删除');
+});
+
+ipcRenderer.on('delete-report-error', (event, data) => {
+  showToast('error', `删除失败: ${data.error}`);
 });
 
 ipcRenderer.on('export-success', (event, data) => {
@@ -738,7 +827,41 @@ function saveSettings() {
   
   const logIntervalSec = parseInt(document.getElementById('logInterval').value);
   
+  const baseline = {
+    cpu: {
+      enabled: document.getElementById('baselineCpuEnabled').checked,
+      min: parseFloat(document.getElementById('baselineCpuMin').value) || 0,
+      max: parseFloat(document.getElementById('baselineCpuMax').value) || 100
+    },
+    memory: {
+      enabled: document.getElementById('baselineMemoryEnabled').checked,
+      min: parseFloat(document.getElementById('baselineMemoryMin').value) || 0,
+      max: parseFloat(document.getElementById('baselineMemoryMax').value) || 100
+    },
+    disk: {
+      enabled: document.getElementById('baselineDiskEnabled').checked,
+      min: parseFloat(document.getElementById('baselineDiskMin').value) || 0,
+      max: parseFloat(document.getElementById('baselineDiskMax').value) || 100
+    }
+  };
+  
+  let hasError = false;
+  for (const key of ['cpu', 'memory', 'disk']) {
+    if (baseline[key].min >= baseline[key].max) {
+      showToast('error', `${key.toUpperCase()} 基线配置错误：最小值必须小于最大值`);
+      hasError = true;
+      break;
+    }
+    if (baseline[key].min < 0 || baseline[key].min > 100 || baseline[key].max < 0 || baseline[key].max > 100) {
+      showToast('error', `${key.toUpperCase()} 基线配置错误：数值必须在 0-100 之间`);
+      hasError = true;
+      break;
+    }
+  }
+  if (hasError) return;
+  
   ipcRenderer.send('update-thresholds', thresholds);
+  ipcRenderer.send('update-baseline-config', baseline);
   ipcRenderer.send('set-log-interval', logIntervalSec * 1000);
 }
 
@@ -868,4 +991,218 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+
+function renderAnomalyReports(reports) {
+  const tbody = document.getElementById('anomalyTableBody');
+  const summary = document.getElementById('anomalySummary');
+
+  if (!reports || reports.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无异常报告，系统正在监测中...</td></tr>';
+    summary.innerHTML = '';
+    return;
+  }
+
+  const cpuCount = reports.filter(r => r.type === 'cpu').length;
+  const memoryCount = reports.filter(r => r.type === 'memory').length;
+  const diskCount = reports.filter(r => r.type === 'disk').length;
+
+  summary.innerHTML = `
+    <span>共 <strong>${reports.length}</strong> 份异常报告</span>
+    <span>CPU异常: <strong>${cpuCount}</strong> 次</span>
+    <span>内存异常: <strong>${memoryCount}</strong> 次</span>
+    <span>磁盘异常: <strong>${diskCount}</strong> 次</span>
+  `;
+
+  tbody.innerHTML = reports.map(report => {
+    const typeColors = {
+      cpu: 'var(--primary-color)',
+      memory: 'var(--success-color)',
+      disk: 'var(--warning-color)'
+    };
+    const typeIcons = { cpu: '💻', memory: '🧠', disk: '💾' };
+
+    return `
+      <tr>
+        <td>
+          <span class="report-type-badge" style="background: ${typeColors[report.type]}22; color: ${typeColors[report.type]}">
+            ${typeIcons[report.type]} ${report.typeName}
+          </span>
+        </td>
+        <td>${new Date(report.generatedAt).toLocaleString('zh-CN')}</td>
+        <td>
+          <div>${new Date(report.startTime).toLocaleTimeString('zh-CN')}</div>
+          <div style="color: var(--text-secondary); font-size: 11px;">至 ${new Date(report.endTime).toLocaleTimeString('zh-CN')}</div>
+        </td>
+        <td>
+          <div>平均: ${report.statistics.average.toFixed(1)}%</div>
+          <div style="color: var(--warning-color);">最高: ${report.statistics.maximum.toFixed(1)}%</div>
+          <div style="color: var(--text-secondary); font-size: 11px;">最低: ${report.statistics.minimum.toFixed(1)}%</div>
+        </td>
+        <td>
+          <span class="exceed-percent" style="color: ${report.exceedPercent > 50 ? 'var(--danger-color)' : 'var(--warning-color)'}">
+            +${report.exceedPercent}%
+          </span>
+        </td>
+        <td>
+          <button class="btn btn-primary btn-sm" onclick="viewReport('${report.id}')">查看</button>
+          <button class="btn btn-outline btn-sm" onclick="downloadReport('${report.id}')">下载</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function viewReport(reportId) {
+  currentViewingReportId = reportId;
+  document.getElementById('reportDetailBody').innerHTML = '<div class="loading">加载中...</div>';
+  document.getElementById('reportDetailTitle').textContent = '异常报告详情';
+  document.getElementById('reportDetailModal').classList.add('active');
+  ipcRenderer.send('get-anomaly-report-detail', reportId);
+}
+
+function downloadReport(reportId) {
+  ipcRenderer.send('download-anomaly-report', reportId);
+}
+
+function closeReportDetailModal() {
+  document.getElementById('reportDetailModal').classList.remove('active');
+  currentViewingReportId = null;
+}
+
+function renderReportDetail(report) {
+  document.getElementById('reportDetailTitle').textContent = `${report.typeName} 异常分析报告`;
+
+  const typeColors = {
+    cpu: 'var(--primary-color)',
+    memory: 'var(--success-color)',
+    disk: 'var(--warning-color)'
+  };
+
+  const samplesChart = report.samples.map(s => ({
+    time: new Date(s.timestamp).toLocaleTimeString('zh-CN'),
+    value: s.value
+  }));
+
+  let samplesTableHtml = report.samples.map((s, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td>${new Date(s.timestamp).toLocaleString('zh-CN')}</td>
+      <td style="color: ${s.value > report.baseline.max ? 'var(--danger-color)' : 'var(--text-primary)'}">
+        ${s.value.toFixed(2)}%
+      </td>
+    </tr>
+  `).join('');
+
+  let processesHtml = report.topProcesses && report.topProcesses.length > 0
+    ? report.topProcesses.map((p, i) => `
+        <tr>
+          <td>${i + 1}</td>
+          <td>${escapeHtml(p.name)}</td>
+          <td>${p.pid}</td>
+          <td>${p.avgCpu.toFixed(2)}%</td>
+          <td>${p.avgMem.toFixed(2)}%</td>
+          <td>${p.occurrenceCount}次</td>
+        </tr>
+      `).join('')
+    : '<tr><td colspan="6" class="empty-state">无进程数据</td></tr>';
+
+  document.getElementById('reportDetailBody').innerHTML = `
+    <div class="report-detail-section">
+      <h4>📋 报告概览</h4>
+      <div class="detail-grid">
+        <div class="detail-item">
+          <span class="detail-label">报告类型</span>
+          <span class="detail-value" style="color: ${typeColors[report.type]}">
+            ${report.typeName}
+          </span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-label">生成时间</span>
+          <span class="detail-value">${new Date(report.generatedAt).toLocaleString('zh-CN')}</span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-label">异常开始</span>
+          <span class="detail-value">${new Date(report.startTime).toLocaleString('zh-CN')}</span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-label">异常结束</span>
+          <span class="detail-value">${new Date(report.endTime).toLocaleString('zh-CN')}</span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-label">采样次数</span>
+          <span class="detail-value">${report.sampleCount} 次</span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-label">超出幅度</span>
+          <span class="detail-value" style="color: var(--danger-color); font-weight: 600;">
+            +${report.exceedPercent}%
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <div class="report-detail-section">
+      <h4>📊 基线与统计</h4>
+      <div class="baseline-compare">
+        <div class="baseline-range-display">
+          <div class="baseline-label">正常基线范围</div>
+          <div class="baseline-bar">
+            <div class="baseline-fill" style="left: ${report.baseline.min}%; width: ${report.baseline.max - report.baseline.min}%; background: var(--success-color);"></div>
+            <div class="baseline-min-label">${report.baseline.min}%</div>
+            <div class="baseline-max-label">${report.baseline.max}%</div>
+          </div>
+        </div>
+        <div class="statistics-grid">
+          <div class="stat-box">
+            <span class="stat-box-label">平均值</span>
+            <span class="stat-box-value">${report.statistics.average.toFixed(2)}%</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-box-label">最大值</span>
+            <span class="stat-box-value" style="color: var(--danger-color);">${report.statistics.maximum.toFixed(2)}%</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-box-label">最小值</span>
+            <span class="stat-box-value">${report.statistics.minimum.toFixed(2)}%</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="report-detail-section">
+      <h4>📈 采样数据明细</h4>
+      <div class="detail-table-container">
+        <table class="detail-table">
+          <thead>
+            <tr>
+              <th>序号</th>
+              <th>采样时间</th>
+              <th>${report.typeName}使用率</th>
+            </tr>
+          </thead>
+          <tbody>${samplesTableHtml}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="report-detail-section">
+      <h4>🔥 资源占用 Top 3 进程</h4>
+      <div class="detail-table-container">
+        <table class="detail-table">
+          <thead>
+            <tr>
+              <th>排名</th>
+              <th>进程名</th>
+              <th>PID</th>
+              <th>平均 CPU</th>
+              <th>平均内存</th>
+              <th>出现次数</th>
+            </tr>
+          </thead>
+          <tbody>${processesHtml}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
 }
